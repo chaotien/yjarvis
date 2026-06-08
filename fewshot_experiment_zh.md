@@ -18,6 +18,9 @@
 
 > 一句話:**先量、後建**。實驗是建後端的前置條件,不是事後驗證。
 
+> 開始 labeling 之前,先看 §1.5「資料準備不變式」— 那三條是 prompt 寫死的假設,
+> 標籤跟資料若違反任一條,實驗就會誤量,模型再好也救不回來。
+
 ---
 
 ## 1. 底層機制 ① — Chat API 的 role 矩陣
@@ -82,6 +85,55 @@ few-shot 要這樣排,以及為什麼亂塞會出包。
 
 > 結論:**role 排列就是 few-shot 的「語法」**,排錯就等於用錯 prompt,跟 schema 鬆緊
 > 比起來,這是更前置、更根本的決定。
+
+---
+
+## 1.5 資料準備不變式 — 三個 prompt 寫死、labeling 必須對齊的細節
+
+`SYSTEM_REASONING` / `SYSTEM_NO_REASONING` / `USER_TURN_TEXT`(`run_fewshot_experiment.py`
+line 65–77)在 prompt 裡定死了三件事。若資料準備或標註違反任何一條,實驗會「量錯題目」
+— 模型再準,數字也沒意義。這三條與 H1/H2/H3/H4 同等重要,屬於規格,不是建議。
+
+### (1) 「角」=「兩條亮邊垂直相交的 L 形頂點」,沒有別的
+
+Prompt 原文:「目標結構的『角』(**兩條亮邊垂直相交的 L 形頂點**)」(line 66 / 72)。
+
+- **不算角的情況**:圓角(fillet)、模糊的交會點、雜訊蓋過讓 L 形看不出來、只剩半條
+  亮邊。這些 case 一律要標 `corner_found=false`,把 `offset_x` / `offset_y` /
+  `magnitude` 都填 `"unknown"`,`aligned=false`。
+- **為什麼不能硬猜**:邊界 case 硬給方向會把 `ox%/oy%` 打稀,也會在 `wrongDir%`
+  製造假錯誤。實驗就量不到「模型在乾淨 L 形上判斷得多好」這個真正想知道的事。
+- 用一個簡單的人類規則:**如果你自己看 5 秒鐘還不敢說角在哪,那就不是角**。
+
+### (2) 十字必須畫在 ROI 影像的「幾何中心」
+
+Prompt 原文:「相對於**畫面中央十字線中心**的對位狀態」(line 66-67);
+「target marker(**十字線中心**)」(line 77)。
+
+- Prompt 在告訴模型「marker 就在影像正中央,你不需要去找它」。所以資料準備時:
+  - 先做 ROI crop,讓目標結構大致進入畫面。
+  - **十字 overlay 畫在 crop 後影像的幾何正中心**,不要相對 SEM frame 算位置。
+- **如果 production 的十字會偏移**(例如有 dynamic offset compensation,marker 不在中心):
+  - **不要直接跑這份 prompt**,先改 `SYSTEM_REASONING` / `USER_TURN_TEXT` 把 marker 位置
+    講清楚(或叫模型先「定位 marker」再「相對它判斷角」),再來實驗。
+  - 否則模型會把畫面中央當 marker → 跟真實 marker 的位置不同 → 結果整批偏掉但你不會
+    察覺,因為 ground truth 也是標相對畫面中央。
+
+### (3) `offset_x` / `offset_y` 是「角相對 marker」,**不是**載台移動方向
+
+Prompt 原文:「偏移語意(**角的頂點相對十字線中心**):offset_x: left(在左)…」
+(line 58–59)。
+
+- `offset_x="left"` 的意思是「**角在十字的左邊**」,**不是**「載台應該往左移」。
+- 控制器要做一次**符號翻轉**才會推對方向:
+  - VLM 回 `offset_x=left`(角在左)→ 控制器把載台往**右**推,角才會往右移到中心。
+  - VLM 回 `offset_y=above`(角在上)→ 控制器把載台往**下**推。
+- **這個 bug 在實驗階段測不到**(實驗只比對標籤,不開閉環)。所以**整合 yMinion
+  `sem_corner_judge` → 控制器**的時候,要用一個人造 case 驗證符號:
+  - 給一張 ground-truth = `offset_x=left, magnitude=large` 的影像。
+  - 走完整 pipeline,確認控制器發給載台的命令是「往右」而非「往左」。
+- **錯一次符號 = 全機看起來 `wrongDir%` 100%**,但實驗 summary.md 會顯示模型完美。
+  這是「實驗 vs production」的最大失誤模式。
 
 ---
 

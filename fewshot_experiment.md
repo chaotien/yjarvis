@@ -96,6 +96,35 @@ Non-negotiables (these are where experiments quietly lie to you):
 4. **Size & humility.** Aim ≥ 30, ideally 50–100 eval images. With small n the confidence
    intervals are wide; report them and don't over-read point estimates.
 
+### 4.1 Image preparation invariants (the prompt assumes these — make labeling match)
+
+The prompt strings in `run_fewshot_experiment.py` (`SYSTEM_REASONING` / `SYSTEM_NO_REASONING`
+/ `USER_TURN_TEXT`, lines 65–77) encode three assumptions about the input image. If
+labeling/data prep contradicts any of them, the experiment will mismeasure even a perfect
+model. These are not "nice to have" — they are the spec.
+
+1. **"Corner" means an L-vertex of two perpendicular bright edges, nothing else.** The
+   prompt literally says "兩條亮邊垂直相交的 L 形頂點". Curved fillets, blurred junctions,
+   noise-degraded intersections, or partial L-shapes are **not** corners — they must be
+   labeled `corner_found=false` with the axis/magnitude fields set to `"unknown"`. Forcing
+   a guess on borderline cases pollutes `ox%/oy%` and inflates `wrongDir%` without
+   surfacing the actual problem (image quality / resolution / contrast).
+
+2. **The crosshair overlay must sit at the geometric center of the ROI crop.** The prompt
+   says "畫面中央十字線中心" / "target marker(十字線中心)" — it assumes the cross is at
+   the frame's center. Compose the ROI crop so the cross is dead-center *before*
+   base64-encoding. If your production pipeline overlays the cross at a non-center offset
+   (e.g. with dynamic offset compensation), you **must** update the prompt strings before
+   running the experiment, or the VLM will judge "alignment" against the wrong reference.
+
+3. **`offset_x` / `offset_y` describe where the corner is, not where to move.** The prompt
+   defines offsets as "角的頂點相對十字線中心" — `offset_x="left"` means *the corner is to
+   the left of the crosshair*, not "move the stage left". The closed-loop controller must
+   invert the sign to compute its move (corner-on-the-left → stage moves right). A correct
+   VLM with a sign-flipped controller will read as 100% `wrongDir%` in production even
+   though both pieces are individually correct. **Verify the wiring with one hand-crafted
+   unit case before trusting any experiment number.**
+
 ---
 
 ## 5. Metrics — designed for closed-loop, not for a leaderboard
