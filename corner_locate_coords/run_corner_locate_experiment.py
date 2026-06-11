@@ -68,13 +68,33 @@ except ImportError:
 # Prompts & schemas
 # ---------------------------------------------------------------------------
 
+# Domain knowledge: tells the model HOW to identify the corner from area geometry, not just
+# what shape to look for. Shared with corner_judge_categorical (same corner definition,
+# different downstream task).
+_DOMAIN_KNOWLEDGE = """領域知識(area 與角的辨識特徵):
+- Area 形狀與位置:area 是一個長方形區域,從 cropped ROI 的「右上角」開始,連續向「左下方」延伸。
+  ROI 右上角必定在 area 內,左下角必定在 area 外;area 的上邊界、右邊界通常與 ROI 上、右邊重合。
+- Area 內部特徵:area 內可觀察到清楚的「重複出現的 pattern」(例如週期性的亮暗紋理 / 陣列結構);
+  area 外則沒有此 pattern,或重複 pattern 中斷消失。
+- Area 邊界判斷:由右上向左下追蹤,重複 pattern「不再繼續」的位置即為 area 邊界。
+    左邊界:一條垂直線(pattern 在水平方向最左端,X_left)。
+    下邊界:一條水平線(pattern 在垂直方向最下端,Y_bottom)。
+- 角(corner)的精確定義:area 左邊界與下邊界的「交點」= (X_left, Y_bottom);
+  也就是 area 形狀上「最左下方」的 L 形頂點。視覺上呈「└」形 —— 從交點往「上」是 area 的左邊界、
+  往「右」是 area 的下邊界,L 形開口朝右上(area 本體所在方向)。
+
+判斷流程建議:
+(a) 在 ROI 右上半部確認 area 存在(可見重複 pattern)。
+(b) 由右上往左下追蹤,找出 pattern 中斷的最左欄 → X_left。
+(c) 同樣追蹤,找出 pattern 中斷的最下列 → Y_bottom。
+(d) (X_left, Y_bottom) 就是要輸出的 (x, y)。"""
+
 _TASK_RULES = """任務規則:
-- 「角」= 兩條亮邊垂直相交的 L 形頂點(corner of the SEM target structure)。
 - 範例影像會在角的真實位置畫有「綠色」十字,assistant 回答給出該綠色十字中心的 (x, y);這些是視覺示範。
-- 測試影像不會有綠色十字,你必須只依靠 SEM 影像內容判斷角的位置,並以同格式輸出 (x, y) 像素座標。
+- 測試影像不會有綠色十字,你必須依照上述領域知識,從 SEM 影像內容(area 邊界)推斷角的位置,並以同格式輸出 (x, y) 像素座標。
 - 影像中可能出現「紅色」十字,代表機台 camera 中心,**與本任務無關,請完全忽略**。
 - 影像座標 (0,0) 為左上角;x 向右為正,y 向下為正。
-- 找不到角(移出視野/失焦/雜訊蓋過):corner_found=false,x 與 y 填 0,aligned 概念在此實驗不適用。
+- 找不到角(移出視野/失焦/雜訊蓋過 / 看不到重複 pattern):corner_found=false,x 與 y 填 0。
 - 數值精度:像素整數 (mode=pixel) 或 0..1000 整數正規化座標 (mode=norm1000)。"""
 
 _FORMAT_PIXEL = (
@@ -86,8 +106,9 @@ _FORMAT_NORM = (
 )
 
 _OUTPUT_REASONING = (
-    "輸出規則:只輸出一個 JSON 物件,reasoning 欄位放最前面(先描述看到的角結構、十字線/marker、"
-    "角相對影像的方位,再決定座標),不得有任何額外文字或 markdown。"
+    "輸出規則:只輸出一個 JSON 物件,reasoning 欄位放最前面"
+    "(依領域知識的判斷流程:先描述看到的 area 範圍與重複 pattern、再定位 pattern 中斷的左邊界 X_left 與下邊界 Y_bottom、"
+    "最後給出 (X_left, Y_bottom) 作為輸出座標),不得有任何額外文字或 markdown。"
 )
 _OUTPUT_NO_REASONING = "輸出規則:只輸出一個 JSON 物件,不得有任何額外文字或 markdown。"
 
@@ -98,7 +119,7 @@ def system_prompt(coord_mode: str, reasoning: bool, W: int, H: int) -> str:
     out = _OUTPUT_REASONING if reasoning else _OUTPUT_NO_REASONING
     return (
         "你是半導體 SEM 對齊的視覺座標模型,輸出影像中目標結構「角」的 (x, y) 座標。\n"
-        + _TASK_RULES + "\n" + fmt + "\n" + out
+        + _DOMAIN_KNOWLEDGE + "\n" + _TASK_RULES + "\n" + fmt + "\n" + out
     )
 
 
@@ -269,7 +290,16 @@ def _exemplar_answer(ex: Dict[str, Any], coord_mode: str, reasoning: bool) -> Di
         y_val = max(0, min(1000, round(1000 * ex["corner_y"] / max(1, H - 1))))
     ans: Dict[str, Any] = {"corner_found": True, "x": x_val, "y": y_val}
     if reasoning:
-        r = ex.get("reasoning") or "影像中綠色十字標示角的位置;依其中心輸出座標。"
+        # Fallback reasoning follows the domain-knowledge trail so the demonstration
+        # shows the model not just the answer but the procedure: confirm area exists,
+        # find pattern-discontinuity boundaries, intersect → corner. Real manifest
+        # 'reasoning' strings override this.
+        r = ex.get("reasoning") or (
+            "ROI 右上方觀察到清楚的重複 pattern,確認 area 存在。"
+            f"由右上向左下追蹤,重複 pattern 中斷的最左欄為 X_left≈{x_val}、"
+            f"最下列為 Y_bottom≈{y_val};兩者交點即為 area corner。"
+            f"綠色十字標示的位置 ({x_val}, {y_val}) 與此交點吻合。"
+        )
         ans = {"reasoning": r, **ans}
     return ans
 

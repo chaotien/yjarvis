@@ -137,6 +137,32 @@ Prompt 原文:「偏移語意(**角的頂點相對十字線中心**):offset_x: l
 
 ---
 
+## 1.6 領域知識 — 把「角」從「任意 L 形頂點」鎖到單一明確的點
+
+`SYSTEM_REASONING` / `SYSTEM_NO_REASONING` 內嵌一段 `_DOMAIN_KNOWLEDGE`
+(完整文字見 `run_fewshot_experiment.py`),用領域規則把「角」收斂成**唯一可定義**的點:
+
+> Area 是 ROI 右上方一個含「重複 pattern」的長方形;
+> 沿 area 向左下追蹤,**重複 pattern 不再繼續**的最左欄 X_left 與最下列 Y_bottom 即為 area 邊界;
+> **角 = (X_left, Y_bottom)**,視覺上呈「└」形,L 形開口朝右上。
+
+### 為什麼這段對 prompt 是關鍵的一層
+
+- **消歧義**:沒有領域知識時,SEM 影像裡可能有多個 L 形交點,模型挑哪個全靠 prior。
+  領域知識把任務從「找一個角」變成「找這個唯一的角」。
+- **建立推理路徑**:reasoning 條件下,模型被引導**先描述 area → 找 pattern 邊界 → 取交點**,
+  而不是直接吐結論。`SYSTEM_REASONING` 的輸出規則也對應改寫了 reasoning 欄位該講什麼,
+  把「依領域知識的判斷流程描述」寫成顯式要求。
+- **跟 few-shot 互補,不是冗餘**:few-shot 給「答案」,領域知識給「推理規則」。
+  兩者一起,模型學到的是「規則 + 範本」,不是「靠範例硬猜」。
+
+### 想做 A/B 比較怎麼辦
+
+最簡單:把 `SYSTEM_*` 拼接式中的 `+ _DOMAIN_KNOWLEDGE +` 整段拿掉,跑一次完整 ladder,
+比對 `wrongDir%` / `ox%` / `oy%` 的差。這就是「有 vs 沒有領域知識」的純對照。
+
+---
+
 ## 2. 底層機制 ② — `guided_json` 與 `response_format` 的差別
 
 兩種都是**結構化輸出(structured output)**,但路徑不同。腳本透過 `--mechanism` 切換,
