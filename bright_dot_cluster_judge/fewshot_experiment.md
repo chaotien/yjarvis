@@ -63,14 +63,20 @@ the two patches are essentially identical, `false`.
 2. **def is first, ref is second.** The two images go into each turn in this fixed order and
    the prompt text states it. If your data prep swaps them, the model compares the wrong way.
    Keep def/ref consistent across exemplars *and* eval.
-3. **Same crop / scale / alignment for the pair.** The "imagine subtracting ref from def"
-   instruction assumes the two patches are co-registered (same location, same size). If they
-   are mis-aligned, even a perfect model can't compute a meaningful diff. Pre-register the
-   pair before encoding.
+3. **Co-registered pair (confirmed for this dataset).** The "imagine subtracting ref from def"
+   instruction assumes the two patches are co-registered (same location, same size) — which is
+   the case here. Keep new data co-registered too; a mis-aligned pair makes a meaningful diff
+   impossible even for a perfect model.
 4. **`single` means *isolated* and *small*.** A single dot that is large enough to read as a
    blob is `cluster` (`large_blob`). Two dots, however small, are `cluster` (`multi_dots`).
    Decide the size/separation threshold once, write it into your labeling guide, and apply it
    uniformly — borderline cases are where binary tasks quietly rot.
+
+> **Tiny patches need upscaling.** The patches are small (e.g. 64×64) and a `single` target can
+> be ~5px — sent raw, the VLM's internal resizing may erase it. Client-side upscaling is a
+> separate experiment axis; the interpolation choice interacts with the single-vs-cluster
+> decision (smoothing can merge nearby dots into a blob → false `cluster`). See
+> **`preprocess_experiment.md`** (and `--ladder preprocess`) for that experiment.
 
 ---
 
@@ -101,19 +107,20 @@ answering `cluster` scores 80%). So the headline is **balanced accuracy**, with 
 directions surfaced:
 
 - **`balAcc%` (headline):** mean of `single` recall and `cluster` recall — robust to imbalance.
-- **`missClu%`:** fraction of true `cluster` pairs called `single` — *under-calling* (a real
-  multi-point/blob event reported as a benign single dot).
-- **`missSgl%`:** fraction of true `single` pairs called `cluster` — *over-calling* (a benign
-  single dot escalated to a cluster).
+- **`missSgl%` (PRIORITY — single-miss is the worse error for this use case):** fraction of true
+  `single` pairs called `cluster`. Drive this down first.
+- **`missClu%` (secondary):** fraction of true `cluster` pairs called `single`.
 - `sRec% / cRec%`: per-class recall (the two numbers `balAcc%` averages).
 - `acc%`: raw accuracy, with a **Wilson 95% CI** — a sanity check, not the objective.
 - `consist%`: does `label` agree with `morphology` (via the `single_dot→single`,
   else→`cluster` map)? Low values mean the model contradicts itself — a prompt/schema smell.
 - `fmt%`: schema compliance (H1; ~100% under guided_json). `lat_ms`: cost (two images × k).
 
-> Which miss is worse is **your** call: in a defect-severity pipeline `missClu%` (under-report)
-> is usually the dangerous one; if clusters trigger expensive rework, `missSgl%` (false alarm)
-> may matter more. The runner reports both — set the priority before reading the table.
+> **Priority for this dataset: `missSgl%`.** Single-miss (a true `single` reported as
+> `cluster`) is the worse error here, so the runner prints `missSgl%` before `missClu%` and
+> you should optimize it first — but watch that pushing it down doesn't blow up `missClu%`
+> (the trivial "always answer single" degenerate). Both are reported; `balAcc%` guards the
+> balance.
 
 The runner recomputes `balAcc%`'s per-repeat value to give a `±sd` across `--repeats`, and a
 Wilson CI on `acc%`. Small-n: read the CI width, don't over-read point estimates.

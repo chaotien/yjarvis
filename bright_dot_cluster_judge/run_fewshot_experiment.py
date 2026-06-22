@@ -2,21 +2,28 @@
 """
 run_fewshot_experiment.py — Few-shot validation for def/ref patch single-vs-cluster judgment.
 
-Sister experiment to ../corner_judge_categorical/. The difference that drives every design
-choice here: **each example is a PAIR of small patches** — `def_patch` (the patch under test)
-and `ref_patch` (the reference) — and the task is a **binary classification**:
+Sister experiment to ../corner_judge_categorical/. Two things make this one different and
+drive every design choice:
 
-    single  — def_patch has ONE relatively independent small bright round dot, brighter than
-              the same spot in ref_patch.
-    cluster — def_patch's extra-bright region is multiple nearby dots flickering together,
-              OR one large blob (一大坨), OR a broad area lighting up (整片). Anything that is
-              NOT a single isolated small dot is `cluster`.
+1. **Each example is a PAIR of small patches** — `def_patch` (under test) and `ref_patch`
+   (reference). The patches are co-registered (same location/size) and mostly overlap in gray
+   level (GLV); only a partial diff matters. The task is a **binary classification**:
 
-The two patches mostly overlap in gray level (GLV); only a partial diff matters. The model is
-asked to reason about "what's brighter in def vs ref" and classify the morphology of that diff.
+       single  — def_patch has ONE relatively independent small bright round dot, brighter
+                 than the same spot in ref_patch.
+       cluster — def_patch's extra-bright region is multiple nearby dots flickering together,
+                 OR one large blob (一大坨), OR a broad area lighting up (整片). Anything that
+                 is NOT a single isolated small dot is `cluster`.
+
+2. **The patches are tiny (e.g. 64x64) and the target can be ~5px.** Sent raw, the VLM's
+   internal resizing can wipe out a 5px dot, so **client-side upscaling is a first-class
+   experiment axis** (see PREP_CONDITIONS / --ladder preprocess and the --upscale/--interp/
+   --contrast overrides). Interpolation matters for THIS task specifically: smoothing
+   (bilinear/lanczos) can merge nearby dots into a blob -> false `cluster`; nearest preserves
+   discreteness. That hypothesis is exactly what the preprocess ladder measures.
 
 Hits vLLM **directly** via the `openai` package (no yJarvis facade) so the experiment has full
-control over messages / guided_json / generation params, exactly like the sibling experiments.
+control over messages / guided_json / generation params.
 
 Environment
 -----------
@@ -38,9 +45,12 @@ The `answer` schema:
 
 Usage
 -----
-    python run_fewshot_experiment.py --data-dir ./patch_eval --repeats 3
-    python run_fewshot_experiment.py --data-dir ./patch_eval \
-        --conditions zeroshot_guided_reasoning fewshot6_guided_reasoning
+    # Stage 1 — find the best preprocessing (fixed k=6 prompt, vary upscale/interp/contrast):
+    python run_fewshot_experiment.py --data-dir ./patch_eval --ladder preprocess --repeats 3
+
+    # Stage 2 — run the prompt ladder at the chosen preprocessing:
+    python run_fewshot_experiment.py --data-dir ./patch_eval --ladder prompt \
+        --upscale 8 --interp nearest --repeats 3
 """
 
 from __future__ import annotations
@@ -83,8 +93,9 @@ _LABEL_RULES = """類別語意(def_patch 相對 ref_patch 新增的亮區形態)
 # mean. Without it the model tends to grade absolute brightness of def_patch alone; with it,
 # the judgment is pinned to the *difference* def-minus-ref and the morphology of that diff.
 _DOMAIN_KNOWLEDGE = """領域知識(def/ref patch 比對方法):
-- 輸入是「兩張同位置、同尺寸的小圖」:第一張 def_patch(待測)、第二張 ref_patch(參考)。
+- 輸入是「兩張同位置、同尺寸、已對齊的小圖」:第一張 def_patch(待測)、第二張 ref_patch(參考)。
   兩張的灰階(GLV)大部分重疊或近似,通常只有局部差異。
+- 影像可能已被放大顯示(原始 patch 很小、目標可能只有數個像素);請以「形態」而非絕對像素數判斷。
 - 核心比較:想像把 def_patch 與 ref_patch 對齊後「逐像素相減」,只看「def 明顯比 ref 亮」的區域。
   忽略 (1) 兩張都亮或都暗的共同區域、(2) 整體一致的亮度位移(可能是曝光/背景漂移,不算缺陷)。
 - 不要被「兩張都亮」的共同亮區誤導 —— 那不是 def 相對 ref 的新增亮點。
@@ -115,9 +126,9 @@ SYSTEM_NO_REASONING = (
 # Each turn carries TWO images. The text pins their order so the model never confuses which is
 # def and which is ref (image order in a multimodal turn is the only signal it has).
 USER_TURN_TEXT = (
-    "以下是同一位置的兩張 patch。第一張影像 = def_patch(待測),第二張影像 = ref_patch(參考)。"
-    "請判斷 def_patch 相對 ref_patch 新增的亮區是 single(單一孤立小圓點)還是 cluster"
-    "(多點/成團/整片),依 schema 輸出。"
+    "以下是同一位置、已對齊的兩張 patch(可能已被放大顯示)。第一張影像 = def_patch(待測),"
+    "第二張影像 = ref_patch(參考)。請判斷 def_patch 相對 ref_patch 新增的亮區是 single"
+    "(單一孤立小圓點)還是 cluster(多點/成團/整片),依 schema 輸出。"
 )
 
 _MORPHOLOGY = ["single_dot", "multi_dots", "large_blob", "broad_area", "unknown"]
@@ -145,8 +156,28 @@ _MORPH_TO_LABEL = {"single_dot": "single", "multi_dots": "cluster",
                    "large_blob": "cluster", "broad_area": "cluster"}
 
 # ---------------------------------------------------------------------------
-# Condition ladder. Each rung isolates one decision (see the .md for the mapping).
-# The user expects ~6 exemplars, so the few-shot rungs are k=3 and k=6.
+# Image preprocessing — the lever the preprocess ladder ablates.
+# A `prep` dict is {scale:int, interp:str, contrast:bool}. RAW_PREP = send patches as-is.
+# ---------------------------------------------------------------------------
+
+_INTERP = {
+    "nearest": Image.NEAREST,    # preserves hard edges / discreteness of nearby dots
+    "bilinear": Image.BILINEAR,
+    "bicubic": Image.BICUBIC,
+    "lanczos": Image.LANCZOS,    # smooth; may merge nearby dots into a blob -> false cluster
+}
+RAW_PREP: Dict[str, Any] = {"scale": 1, "interp": "nearest", "contrast": False}
+
+def _prep_key(prep: Dict[str, Any]) -> str:
+    return f"s{prep['scale']}-{prep['interp']}-c{int(bool(prep['contrast']))}"
+
+# ---------------------------------------------------------------------------
+# Condition ladders. Each rung adds ONE thing, so an adjacent-rung difference isolates that
+# decision. The user expects ~6 exemplars, so the few-shot rungs are k=3 and k=6.
+#
+#   prompt ladder      — vary k / guided / reasoning at a fixed preprocessing.
+#   preprocess ladder  — vary upscale / interpolation / contrast at the fixed best prompt
+#                        (k=6, guided, reasoning). This is the lever for tiny ~5px targets.
 # ---------------------------------------------------------------------------
 
 CONDITIONS: List[Dict[str, Any]] = [
@@ -157,7 +188,23 @@ CONDITIONS: List[Dict[str, Any]] = [
     {"name": "fewshot6_guided_reasoning",   "k": 6, "guided": True,  "reasoning": True},
     {"name": "fewshot6_guided_noreasoning", "k": 6, "guided": True,  "reasoning": False},
 ]
-_CONDITION_NAMES = {c["name"] for c in CONDITIONS}
+
+def _prep_cond(name: str, scale: int, interp: str, contrast: bool) -> Dict[str, Any]:
+    return {"name": name, "k": 6, "guided": True, "reasoning": True,
+            "prep": {"scale": scale, "interp": interp, "contrast": contrast}}
+
+PREP_CONDITIONS: List[Dict[str, Any]] = [
+    _prep_cond("prep_raw_x1",             1,  "nearest", False),  # baseline: tiny patch as-is
+    _prep_cond("prep_x4_nearest",         4,  "nearest", False),  # 64 -> 256
+    _prep_cond("prep_x8_nearest",         8,  "nearest", False),  # 64 -> 512
+    _prep_cond("prep_x8_lanczos",         8,  "lanczos", False),  # smoothing: does it blur dots together?
+    _prep_cond("prep_x8_nearest_contrast",8,  "nearest", True),   # + joint contrast stretch for subtle GLV diff
+    _prep_cond("prep_x12_nearest",        12, "nearest", False),  # 64 -> 768 (token-cost upper end)
+]
+
+LADDERS = {"prompt": CONDITIONS, "preprocess": PREP_CONDITIONS,
+           "all": CONDITIONS + PREP_CONDITIONS}
+_CONDITION_NAMES = {c["name"] for c in (CONDITIONS + PREP_CONDITIONS)}
 
 ALLOWED_LABELS = {"single", "cluster"}
 
@@ -219,34 +266,62 @@ def call_vllm(messages: List[Dict[str, Any]], schema: Optional[Dict[str, Any]],
     return "", (time.time() - t0) * 1000.0, last_err
 
 # ---------------------------------------------------------------------------
-# Data / message building
+# Data / message building (preprocessing applied uniformly to exemplars AND eval)
 # ---------------------------------------------------------------------------
 
-def _data_uri(img_path: str) -> str:
-    with Image.open(img_path) as raw:
-        img = raw.convert("RGB")
+def _joint_contrast(def_img: Image.Image, ref_img: Image.Image,
+                    lo_pct: float = 2.0, hi_pct: float = 98.0) -> Tuple[Image.Image, Image.Image]:
+    """Percentile stretch using a SINGLE LUT computed over BOTH patches, so the def-vs-ref
+    brightness relationship is preserved. An independent per-image stretch would destroy the
+    very diff we are trying to read (def's extra-bright dot could be normalized away)."""
+    combined = sorted(list(def_img.getdata()) + list(ref_img.getdata()))
+    n = len(combined)
+    lo = combined[max(0, int(n * lo_pct / 100))]
+    hi = combined[min(n - 1, int(n * hi_pct / 100))]
+    if hi <= lo:
+        return def_img, ref_img
+    sc = 255.0 / (hi - lo)
+    lut = [min(255, max(0, int((v - lo) * sc))) for v in range(256)]
+    return def_img.point(lut), ref_img.point(lut)
+
+def _resize(img: Image.Image, prep: Dict[str, Any]) -> Image.Image:
+    if prep["scale"] == 1:
+        return img
+    w, h = img.size
+    return img.resize((w * prep["scale"], h * prep["scale"]), _INTERP[prep["interp"]])
+
+def _to_uri(img: Image.Image) -> str:
     buf = io.BytesIO()
-    img.save(buf, format="PNG")  # PNG is lossless; JPEG artifacts would corrupt the diff signal
+    img.convert("RGB").save(buf, format="PNG")  # PNG lossless; JPEG artifacts corrupt the diff
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-# Cache: exemplar patch URIs are constant across all eval items / repeats / conditions, so
-# encode each exemplar image at most once per run.
-_URI_CACHE: Dict[str, str] = {}
+# Cache: exemplar pair URIs are constant across all eval items / repeats given a fixed prep, so
+# encode each (def, ref, prep) at most once. Keyed by prep because contrast couples the pair.
+_PAIR_URI_CACHE: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
 
-def _cached_data_uri(img_path: str) -> str:
-    uri = _URI_CACHE.get(img_path)
-    if uri is None:
-        uri = _data_uri(img_path)
-        _URI_CACHE[img_path] = uri
-    return uri
+def _pair_uris(def_path: str, ref_path: str, prep: Dict[str, Any],
+               cache: bool = False) -> Tuple[str, str]:
+    key = (def_path, ref_path, _prep_key(prep))
+    if cache and key in _PAIR_URI_CACHE:
+        return _PAIR_URI_CACHE[key]
+    with Image.open(def_path) as d0, Image.open(ref_path) as r0:
+        d, r = d0.convert("L"), r0.convert("L")
+    if prep["contrast"]:
+        d, r = _joint_contrast(d, r)
+    d, r = _resize(d, prep), _resize(r, prep)
+    uris = (_to_uri(d), _to_uri(r))
+    if cache:
+        _PAIR_URI_CACHE[key] = uris
+    return uris
 
-def _pair_content(def_path: str, ref_path: str, cache: bool = False) -> List[Dict[str, Any]]:
+def _pair_content(def_path: str, ref_path: str, prep: Dict[str, Any],
+                  cache: bool = False) -> List[Dict[str, Any]]:
     """One user turn = prompt text + def_patch image + ref_patch image (in that fixed order)."""
-    uri = _cached_data_uri if cache else _data_uri
+    du, ru = _pair_uris(def_path, ref_path, prep, cache=cache)
     return [
         {"type": "text", "text": USER_TURN_TEXT},
-        {"type": "image_url", "image_url": {"url": uri(def_path)}},
-        {"type": "image_url", "image_url": {"url": uri(ref_path)}},
+        {"type": "image_url", "image_url": {"url": du}},
+        {"type": "image_url", "image_url": {"url": ru}},
     ]
 
 def load_manifest(data_dir: str, name: str) -> List[Dict[str, Any]]:
@@ -263,6 +338,7 @@ def load_manifest(data_dir: str, name: str) -> List[Dict[str, Any]]:
 
 def build_messages(cond: Dict[str, Any], item: Dict[str, Any],
                    exemplars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    prep = cond.get("prep", RAW_PREP)
     system = SYSTEM_REASONING if cond["reasoning"] else SYSTEM_NO_REASONING
     msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
     for ex in exemplars[: cond["k"]]:  # fixed order; see order-sensitivity note in .md
@@ -270,9 +346,9 @@ def build_messages(cond: Dict[str, Any], item: Dict[str, Any],
         if not cond["reasoning"]:
             ans.pop("reasoning", None)
         msgs.append({"role": "user",
-                     "content": _pair_content(ex["_def_path"], ex["_ref_path"], cache=True)})
+                     "content": _pair_content(ex["_def_path"], ex["_ref_path"], prep, cache=True)})
         msgs.append({"role": "assistant", "content": json.dumps(ans, ensure_ascii=False)})
-    msgs.append({"role": "user", "content": _pair_content(item["_def_path"], item["_ref_path"])})
+    msgs.append({"role": "user", "content": _pair_content(item["_def_path"], item["_ref_path"], prep)})
     return msgs
 
 # ---------------------------------------------------------------------------
@@ -349,17 +425,29 @@ def wilson(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
 # Run
 # ---------------------------------------------------------------------------
 
-def run(args: argparse.Namespace) -> None:
+def _resolve_conditions(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    base = LADDERS[args.ladder]
     if args.conditions:
         unknown = [n for n in args.conditions if n not in _CONDITION_NAMES]
         if unknown:
             print(f"[warn] unknown --conditions ignored: {unknown}. "
                   f"Known: {sorted(_CONDITION_NAMES)}", file=sys.stderr)
+        base = [c for c in base if c["name"] in args.conditions]
+    # Global preprocessing override: applies to ALL selected conditions. Lets you run the
+    # prompt ladder at one chosen preprocessing (Stage 2 above).
+    if args.upscale is not None or args.interp is not None or args.contrast:
+        ov = {"scale": args.upscale if args.upscale is not None else 1,
+              "interp": args.interp or "nearest", "contrast": bool(args.contrast)}
+        base = [{**c, "prep": ov} for c in base]
+        print(f"[prep override] all conditions -> {_prep_key(ov)}")
+    return base
+
+def run(args: argparse.Namespace) -> None:
     eval_set = load_manifest(args.data_dir, "eval_manifest.json")
     exemplars = load_manifest(args.data_dir, "exemplar_manifest.json")
     if args.limit:
         eval_set = eval_set[: args.limit]
-    conds = [c for c in CONDITIONS if (not args.conditions or c["name"] in args.conditions)]
+    conds = _resolve_conditions(args)
     if not conds:
         print("[abort] no matching conditions to run", file=sys.stderr)
         return
@@ -370,8 +458,9 @@ def run(args: argparse.Namespace) -> None:
         if cond["k"] > len(exemplars):
             print(f"[skip] {cond['name']}: needs {cond['k']} exemplars, only {len(exemplars)} available")
             continue
+        prep = cond.get("prep", RAW_PREP)
         print(f"\n=== condition: {cond['name']} (k={cond['k']}, guided={cond['guided']}, "
-              f"reasoning={cond['reasoning']}) ===")
+              f"reasoning={cond['reasoning']}, prep={_prep_key(prep)}) ===")
         for rep in range(args.repeats):
             for item in eval_set:
                 schema = (SCHEMA_REASONING if cond["reasoning"] else SCHEMA_NO_REASONING) if cond["guided"] else None
@@ -380,7 +469,7 @@ def run(args: argparse.Namespace) -> None:
                     msgs, schema, model, args.temperature, args.max_tokens, args.timeout, args.mechanism)
                 pred = None if err else parse_prediction(content)
                 sc = score_one(item["answer"], pred)
-                raw_rows.append({"condition": cond["name"], "repeat": rep,
+                raw_rows.append({"condition": cond["name"], "repeat": rep, "prep": _prep_key(prep),
                                  "def_patch": item["def_patch"], "ref_patch": item["ref_patch"],
                                  "error": err or "", "latency_ms": round(latency, 1),
                                  "raw": content[:500], **sc})
@@ -436,7 +525,7 @@ def _aggregate(rows: List[Dict[str, Any]], repeats: int) -> List[Dict[str, Any]]
         lat = [r["latency_ms"] for r in cr if r.get("latency_ms") is not None]
         lo, hi = wilson(ak, an)
         out.append({
-            "condition": cname, "n_calls": len(cr),
+            "condition": cname, "prep": cr[0].get("prep", ""), "n_calls": len(cr),
             "format_pct": 100 * fk / fn if fn else 0.0,
             "acc": 100 * ak / an if an else 0.0,
             "acc_ci": (100 * lo, 100 * hi),
@@ -446,38 +535,38 @@ def _aggregate(rows: List[Dict[str, Any]], repeats: int) -> List[Dict[str, Any]]
             "cluster_prec": 100 * cp_k / cp_n if cp_n else 0.0,
             "bal_acc": 100 * bal_acc,
             "bal_std": 100 * std_rep,
-            # the two directional errors: miss_cluster = GT cluster called single (under-call);
-            # miss_single = GT single called cluster (over-call).
-            "miss_cluster_pct": 100 * (1 - cluster_rec),
+            # the two directional errors: miss_single = GT single called cluster (PRIORITY:
+            # single-miss is the worse error here); miss_cluster = GT cluster called single.
             "miss_single_pct": 100 * (1 - single_rec),
+            "miss_cluster_pct": 100 * (1 - cluster_rec),
             "consistency_pct": 100 * ck / cn if cn else float("nan"),
             "latency_ms": sum(lat) / len(lat) if lat else 0.0,
         })
     return out
 
 def _print_summary(summary: List[Dict[str, Any]]) -> None:
-    print("\n" + "=" * 120)
-    hdr = ("condition", "fmt%", "acc%", "balAcc%(±sd)", "95%CI", "sRec%", "cRec%",
-           "missClu%", "missSgl%", "consist%", "lat_ms")
-    print("{:<30} {:>5} {:>5} {:>13} {:>11} {:>6} {:>6} {:>8} {:>8} {:>9} {:>8}".format(*hdr))
-    print("-" * 120)
+    print("\n" + "=" * 128)
+    hdr = ("condition", "prep", "fmt%", "acc%", "balAcc%(±sd)", "95%CI", "sRec%", "cRec%",
+           "missSgl%", "missClu%", "consist%", "lat_ms")
+    print("{:<26} {:>12} {:>5} {:>5} {:>13} {:>11} {:>6} {:>6} {:>8} {:>8} {:>9} {:>8}".format(*hdr))
+    print("-" * 128)
     for s in summary:
         ci = f"[{s['acc_ci'][0]:.0f},{s['acc_ci'][1]:.0f}]"
         cons = f"{s['consistency_pct']:.0f}" if s["consistency_pct"] == s["consistency_pct"] else "n/a"
-        print("{:<30} {:>5.1f} {:>5.1f} {:>13} {:>11} {:>6.0f} {:>6.0f} {:>8.1f} {:>8.1f} {:>9} {:>8.0f}".format(
-            s["condition"], s["format_pct"], s["acc"],
+        print("{:<26} {:>12} {:>5.1f} {:>5.1f} {:>13} {:>11} {:>6.0f} {:>6.0f} {:>8.1f} {:>8.1f} {:>9} {:>8.0f}".format(
+            s["condition"], s["prep"], s["format_pct"], s["acc"],
             f"{s['bal_acc']:.1f}±{s['bal_std']:.1f}", ci,
             s["single_recall"], s["cluster_recall"],
-            s["miss_cluster_pct"], s["miss_single_pct"], cons, s["latency_ms"]))
-    print("=" * 120)
-    print("關鍵看 balAcc%(類別不平衡時比 acc% 可靠)與兩個方向的漏判:")
-    print("  missClu% = 真 cluster 被判成 single(漏報成團/缺陷低估);missSgl% = 真 single 被判成 cluster(過度報警)。")
-    print("  哪一個更危險取決於下游用途;先壓你最在意的那一個。consist% = label 與 morphology 是否自洽。")
+            s["miss_single_pct"], s["miss_cluster_pct"], cons, s["latency_ms"]))
+    print("=" * 128)
+    print("優先指標(此用途 single 漏判較嚴重):missSgl% = 真 single 被判成 cluster,先壓這個。")
+    print("  次要:missClu% = 真 cluster 被判成 single;balAcc% = 兩類 recall 平均(類別不平衡時比 acc% 可靠)。")
+    print("  consist% = label 與 morphology 是否自洽;preprocess ladder 另看 lat_ms(放大=更多 token=更慢)。")
 
 def _write_raw_csv(rows: List[Dict[str, Any]], path: str) -> None:
     if not rows:
         return
-    cols = ["condition", "repeat", "def_patch", "ref_patch", "format_ok", "label_ok",
+    cols = ["condition", "prep", "repeat", "def_patch", "ref_patch", "format_ok", "label_ok",
             "gt_label", "pred_label", "consistency_ok", "latency_ms", "error", "raw"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -487,21 +576,22 @@ def _write_raw_csv(rows: List[Dict[str, Any]], path: str) -> None:
 def _write_summary_md(summary: List[Dict[str, Any]], model: str, args: argparse.Namespace, path: str) -> None:
     lines = [f"# def/ref patch single-vs-cluster few-shot experiment — summary",
              f"- model: `{model}` | temperature: {args.temperature} | repeats: {args.repeats} "
-             f"| guided mechanism: {args.mechanism}",
+             f"| ladder: {args.ladder} | guided mechanism: {args.mechanism}",
              f"- eval pairs: see `{args.data_dir}/eval_manifest.json` | "
              f"exemplars: `{args.data_dir}/exemplar_manifest.json`", "",
-             "| condition | fmt% | acc% | balAcc%±sd | 95%CI | sRec% | cRec% | missClu% | missSgl% | consist% | lat_ms |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| condition | prep | fmt% | acc% | balAcc%±sd | 95%CI | sRec% | cRec% | missSgl% | missClu% | consist% | lat_ms |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in summary:
         ci = f"[{s['acc_ci'][0]:.0f},{s['acc_ci'][1]:.0f}]"
         cons = f"{s['consistency_pct']:.0f}" if s["consistency_pct"] == s["consistency_pct"] else "n/a"
-        lines.append(f"| {s['condition']} | {s['format_pct']:.1f} | {s['acc']:.1f} | "
+        lines.append(f"| {s['condition']} | {s['prep']} | {s['format_pct']:.1f} | {s['acc']:.1f} | "
                      f"{s['bal_acc']:.1f}±{s['bal_std']:.1f} | {ci} | {s['single_recall']:.0f} | "
-                     f"{s['cluster_recall']:.0f} | {s['miss_cluster_pct']:.1f} | "
-                     f"{s['miss_single_pct']:.1f} | {cons} | {s['latency_ms']:.0f} |")
-    lines += ["", "**判讀**:類別不平衡時 `balAcc%`(single/cluster 兩類 recall 的平均)比 `acc%` 可靠;"
-              "`missClu%`(真 cluster 漏判成 single)與 `missSgl%`(真 single 過判成 cluster)是兩個方向的錯誤,"
-              "依下游用途決定先壓哪個。小樣本請看 95%CI 寬度,不要過度解讀點估計。"]
+                     f"{s['cluster_recall']:.0f} | {s['miss_single_pct']:.1f} | "
+                     f"{s['miss_cluster_pct']:.1f} | {cons} | {s['latency_ms']:.0f} |")
+    lines += ["", "**判讀**:此用途 **single 漏判較嚴重**,優先壓 `missSgl%`(真 single 被判成 cluster);"
+              "`missClu%`(真 cluster 被判成 single)次要。類別不平衡時 `balAcc%` 比 `acc%` 可靠。"
+              "preprocess ladder 額外比較放大倍率/內插:smoothing(lanczos)可能把鄰近點糊成一坨而誤判,"
+              "nearest 較能保留離散性;`lat_ms` 反映放大帶來的 token 成本。小樣本看 95%CI 寬度,別過度解讀點估計。"]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -510,7 +600,16 @@ def main() -> None:
         description="Few-shot validation for def/ref patch single-vs-cluster judgment (direct vLLM)")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out-dir", default="./experiment_out")
-    ap.add_argument("--conditions", nargs="*", help="subset of condition names; default all")
+    ap.add_argument("--ladder", choices=list(LADDERS), default="prompt",
+                    help="which condition ladder: prompt (vary k/guided/reasoning), "
+                         "preprocess (vary upscale/interp/contrast at fixed k=6), or all")
+    ap.add_argument("--conditions", nargs="*", help="subset of condition names; default = whole ladder")
+    ap.add_argument("--upscale", type=int, default=None,
+                    help="override: integer client-side upscale factor applied to ALL conditions")
+    ap.add_argument("--interp", choices=list(_INTERP), default=None,
+                    help="override: interpolation for --upscale (default nearest)")
+    ap.add_argument("--contrast", action="store_true",
+                    help="override: joint percentile contrast stretch across the def/ref pair")
     ap.add_argument("--repeats", type=int, default=1, help="repeats per item (>=3 to characterize variance)")
     ap.add_argument("--limit", type=int, default=0, help="cap eval items (0=all)")
     ap.add_argument("--model", default=None)
